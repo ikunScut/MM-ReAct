@@ -6,78 +6,27 @@ MM-ReAct Trace
     image_path: examples/inputs/demo.jpg
 
 [2] THOUGHT: ReAct turn 1: planner decided the next step.
-    thought: The request still needs low_light_enhance. I will run it next because: Improve brightness and recover details in dark regions.
-    next_tool: low_light_enhance
+    thought: The next step is to call color_enhance.
+    next_tool: color_enhance
     is_final: False
 
-[3] ACTION: Running tool 1: low_light_enhance.
-    tool_name: low_light_enhance
-    args: {'strength': 0.75}
+[3] ACTION: Running tool 1: color_enhance.
+    tool_name: color_enhance
+    args: {}
     input_image: examples/inputs/demo.jpg
-    reason: Improve brightness and recover details in dark regions.
+    reason: The model selected color_enhance.
 
-[4] OBSERVATION: Tool 1 finished: low_light_enhance.
-    tool_name: low_light_enhance
+[4] OBSERVATION: Tool 1 finished: color_enhance.
+    tool_name: color_enhance
     input_image: examples/inputs/demo.jpg
-    output_image: outputs/images/demo.s1_low_light_enhance.jpg
-    metadata: {'backend': 'mock', 'note': 'Replace this mock tool with a real image enhancement model.', 'args': {'strength': 0.75}}
+    output_image: outputs/images/demo.s1_color_enhance.jpg
+    metadata: {'backend': 'mock', 'note': 'Replace this mock tool with a real image enhancement model.', 'args': {}}
 
 [5] THOUGHT: ReAct turn 2: planner decided the next step.
-    thought: The request still needs denoise. Last observation came from low_light_enhance and produced outputs/images/demo.s1_low_light_enhance.jpg. I will run it next because: Remove noise before sharpening or super-resolution.
-    next_tool: denoise
-    is_final: False
-
-[6] ACTION: Running tool 2: denoise.
-    tool_name: denoise
-    args: {'level': 'auto'}
-    input_image: outputs/images/demo.s1_low_light_enhance.jpg
-    reason: Remove noise before sharpening or super-resolution.
-
-[7] OBSERVATION: Tool 2 finished: denoise.
-    tool_name: denoise
-    input_image: outputs/images/demo.s1_low_light_enhance.jpg
-    output_image: outputs/images/demo.s1_low_light_enhance.s2_denoise.jpg
-    metadata: {'backend': 'mock', 'note': 'Replace this mock tool with a real image enhancement model.', 'args': {'level': 'auto'}}
-
-[8] THOUGHT: ReAct turn 3: planner decided the next step.
-    thought: The request still needs deblur. Last observation came from denoise and produced outputs/images/demo.s1_low_light_enhance.s2_denoise.jpg. I will run it next because: Recover edge clarity and reduce blur.
-    next_tool: deblur
-    is_final: False
-
-[9] ACTION: Running tool 3: deblur.
-    tool_name: deblur
-    args: {'mode': 'motion_or_defocus'}
-    input_image: outputs/images/demo.s1_low_light_enhance.s2_denoise.jpg
-    reason: Recover edge clarity and reduce blur.
-
-[10] OBSERVATION: Tool 3 finished: deblur.
-    tool_name: deblur
-    input_image: outputs/images/demo.s1_low_light_enhance.s2_denoise.jpg
-    output_image: outputs/images/demo.s1_low_light_enhance.s2_denoise.s3_deblur.jpg
-    metadata: {'backend': 'mock', 'note': 'Replace this mock tool with a real image enhancement model.', 'args': {'mode': 'motion_or_defocus'}}
-
-[11] THOUGHT: ReAct turn 4: planner decided the next step.
-    thought: The request still needs super_resolution. Last observation came from deblur and produced outputs/images/demo.s1_low_light_enhance.s2_denoise.s3_deblur.jpg. I will run it next because: Increase output resolution as the final enhancement step.
-    next_tool: super_resolution
-    is_final: False
-
-[12] ACTION: Running tool 4: super_resolution.
-    tool_name: super_resolution
-    args: {'scale': 4}
-    input_image: outputs/images/demo.s1_low_light_enhance.s2_denoise.s3_deblur.jpg
-    reason: Increase output resolution as the final enhancement step.
-
-[13] OBSERVATION: Tool 4 finished: super_resolution.
-    tool_name: super_resolution
-    input_image: outputs/images/demo.s1_low_light_enhance.s2_denoise.s3_deblur.jpg
-    output_image: outputs/images/demo.s1_low_light_enhance.s2_denoise.s3_deblur.s4_super_resolution.jpg
-    metadata: {'backend': 'mock', 'note': 'Replace this mock tool with a real image enhancement model.', 'args': {'scale': 4}}
-
-[14] THOUGHT: ReAct turn 5: planner decided the next step.
-    thought: All requested enhancement operations have been completed. The latest image is ready to return as the final answer.
+    thought: The requested operation has been completed.
     next_tool: None
     is_final: True
 
-[15] FINAL: Agent returned the final answer.
-    answer: Final answer: the image enhancement pipeline is complete. The final image is saved at outputs/images/demo.s1_low_light_enhance.s2_denoise.s3_deblur.s4_super_resolution.jpg.
-    output_image: outputs/images/demo.s1_low_light_enhance.s2_denoise.s3_deblur.s4_super_resolution.jpg
+[6] FINAL: Agent returned the final answer.
+    answer: Final image is saved at outputs/images/demo.s1_color_enhance.jpg.
+    output_image: outputs/images/demo.s1_color_enhance.jpg

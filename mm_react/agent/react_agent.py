@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .executor import ImageExecutor, StepResult
 from .memory import AgentMemory
-from .planner import ImagePlanner
+from .planner import ImagePlanner, PlanningHistoryItem, ReActDecision
 
 
 @dataclass(frozen=True)
@@ -43,8 +43,7 @@ class ReActAgent:
     def run(self, user_request: str, input_image: str | Path) -> ReActRunResult:
         input_path = Path(input_image)
         current_image = input_path
-        completed_steps: list[str] = []
-        observations: list[dict[str, str]] = []
+        planning_history: list[PlanningHistoryItem] = []
         step_results: list[StepResult] = []
 
         self.memory.add_user_request(user_request, input_path)
@@ -54,10 +53,11 @@ class ReActAgent:
                 user_request=user_request,
                 input_image=input_path,
                 current_image=current_image,
-                completed_steps=completed_steps,
-                observations=observations,
+                planning_history=planning_history,
             )
             self.memory.add_thought(turn, decision)
+            history_item = self._history_item(turn, decision)
+            planning_history.append(history_item)
 
             if decision.is_final:
                 final_answer = decision.final_answer or ""
@@ -70,7 +70,9 @@ class ReActAgent:
                 )
 
             if decision.tool_call is None:
-                raise RuntimeError("Planner returned neither a tool call nor final answer.")
+                raise RuntimeError(
+                    "Planner returned neither a tool call nor final answer."
+                )
 
             step_result = self.executor.execute_step(
                 tool_call=decision.tool_call,
@@ -79,14 +81,13 @@ class ReActAgent:
                 memory=self.memory,
             )
             step_results.append(step_result)
-            completed_steps.append(step_result.tool_name)
+            history_item.observation = {
+                "tool_name": step_result.tool_name,
+                "input_image": str(step_result.input_image),
+                "output_image": str(step_result.output_image),
+                "metadata": step_result.metadata,
+            }
             current_image = step_result.output_image
-            observations.append(
-                {
-                    "tool_name": step_result.tool_name,
-                    "output_image": str(step_result.output_image),
-                }
-            )
 
         final_answer = (
             "Final answer: stopped because the maximum number of ReAct turns "
@@ -100,3 +101,6 @@ class ReActAgent:
             memory=self.memory,
         )
 
+    @staticmethod
+    def _history_item(turn: int, decision: ReActDecision) -> PlanningHistoryItem:
+        return PlanningHistoryItem.from_decision(turn, decision)

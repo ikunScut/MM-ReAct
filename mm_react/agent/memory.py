@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .planner import Plan, ReActDecision, ToolCall
+from .planner import ReActDecision, ToolCall
 
 
 @dataclass(frozen=True)
@@ -34,23 +34,6 @@ class AgentMemory:
             event_type="user",
             message="Received user request.",
             data={"request": request, "image_path": str(image_path)},
-        )
-
-    def add_plan(self, plan: Plan) -> None:
-        self.add(
-            event_type="thought",
-            message="Planner created an ordered tool plan.",
-            data={
-                "final_goal": plan.final_goal,
-                "steps": [
-                    {
-                        "tool_name": step.tool_name,
-                        "args": step.args,
-                        "reason": step.reason,
-                    }
-                    for step in plan.steps
-                ],
-            },
         )
 
     def add_thought(self, turn: int, decision: ReActDecision) -> None:

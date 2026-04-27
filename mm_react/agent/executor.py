@@ -1,22 +1,19 @@
-"""Executor demo for MM-ReAct image enhancement plans.
+"""Executor demo for MM-ReAct image enhancement steps.
 
-The executor receives a Plan from the planner and runs each ToolCall in order.
-This demo uses mock tools that only create output paths and metadata. Real image
-enhancement models can be plugged in by passing a custom tool_registry.
+The ReAct loop gives the executor one ToolCall at a time. This demo uses mock
+tools that only create output paths and metadata. Real image enhancement models
+can be plugged in by passing a custom tool_registry.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from ..tools import DEMO_TOOL_REGISTRY
+from ..tools import DEFAULT_TOOL_REGISTRY, ToolFn
 from .memory import AgentMemory
-from .planner import Plan, ToolCall
-
-
-ToolFn = Callable[[Path, ToolCall, Path], dict[str, Any]]
+from .planner import ToolCall
 
 
 @dataclass(frozen=True)
@@ -29,17 +26,8 @@ class StepResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class ExecutionResult:
-    """Result of a complete plan execution."""
-
-    input_image: Path
-    final_image: Path
-    steps: list[StepResult]
-
-
 class ImageExecutor:
-    """Executes planned image enhancement steps."""
+    """Executes one planned image enhancement step at a time."""
 
     def __init__(
         self,
@@ -47,34 +35,7 @@ class ImageExecutor:
         tool_registry: dict[str, ToolFn] | None = None,
     ) -> None:
         self.output_dir = Path(output_dir)
-        self.tool_registry = tool_registry or self._build_mock_registry()
-
-    def execute(
-        self, plan: Plan, memory: AgentMemory | None = None
-    ) -> ExecutionResult:
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        current_image = plan.input_image
-        results: list[StepResult] = []
-
-        for index, tool_call in enumerate(plan.steps, start=1):
-            step_result = self.execute_step(
-                tool_call=tool_call,
-                input_image=current_image,
-                step_index=index,
-                memory=memory,
-            )
-            results.append(step_result)
-            current_image = step_result.output_image
-
-        if memory is not None:
-            memory.add_final_result(current_image)
-
-        return ExecutionResult(
-            input_image=plan.input_image,
-            final_image=current_image,
-            steps=results,
-        )
+        self.tool_registry = tool_registry or dict(DEFAULT_TOOL_REGISTRY)
 
     def execute_step(
         self,
@@ -127,36 +88,3 @@ class ImageExecutor:
         stem = input_image.stem or "image"
         safe_tool_name = tool_name.replace(" ", "_")
         return self.output_dir / f"{stem}.s{step_index}_{safe_tool_name}{suffix}"
-
-    def _build_mock_registry(self) -> dict[str, ToolFn]:
-        return {
-            **DEMO_TOOL_REGISTRY,
-            "deblur": self._mock_tool,
-            "denoise": self._mock_tool,
-            "low_light_enhance": self._mock_tool,
-            "super_resolution": self._mock_tool,
-            "color_enhance": self._mock_tool,
-            "face_restore": self._mock_tool,
-        }
-
-    @staticmethod
-    def _mock_tool(
-        input_image: Path, tool_call: ToolCall, output_image: Path
-    ) -> dict[str, Any]:
-        output_image.write_text(
-            "\n".join(
-                [
-                    "This is a mock image artifact for the MM-ReAct demo.",
-                    f"input_image={input_image}",
-                    f"tool_name={tool_call.tool_name}",
-                    f"args={tool_call.args}",
-                ]
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        return {
-            "backend": "mock",
-            "note": "Replace this mock tool with a real image enhancement model.",
-            "args": tool_call.args,
-        }

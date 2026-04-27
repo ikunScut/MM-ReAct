@@ -1,21 +1,29 @@
-"""Rule-based planner demo for image enhancement tools.
+"""Planner for one MM-ReAct decision.
 
-The planner turns a user request into an ordered list of tool calls. This is a
-small demo version: it uses keywords instead of an LLM, but the returned data
-structures are designed to survive an LLM-backed implementation later.
+核心流程只有一条：
+1. planner 构造 prompt；
+2. 调用预训练模型得到文本回复；
+3. 用正则提取 <thought>、<tools>、<final_answer>；
+4. 归一化为 ReActDecision，交给主循环执行。
 """
 
 from __future__ import annotations
 
+import base64
 import json
-from dataclasses import dataclass, field
+import mimetypes
+import os
+import re
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from ..tools import AVAILABLE_TOOL_NAMES
 
 
 @dataclass(frozen=True)
 class ToolCall:
-    """A single tool invocation planned by the agent."""
+    """One tool invocation selected by the planner."""
 
     tool_name: str
     args: dict[str, Any] = field(default_factory=dict)
@@ -23,33 +31,8 @@ class ToolCall:
 
 
 @dataclass(frozen=True)
-class Plan:
-    """A complete plan for one user request."""
-
-    user_request: str
-    input_image: Path
-    steps: list[ToolCall]
-    final_goal: str
-
-    def to_trace(self) -> str:
-        lines = [
-            f"User request: {self.user_request}",
-            f"Input image: {self.input_image}",
-            f"Final goal: {self.final_goal}",
-            "Plan:",
-        ]
-        for index, step in enumerate(self.steps, start=1):
-            lines.append(
-                f"  {index}. {step.tool_name} args={step.args} reason={step.reason}"
-            )
-        return "\n".join(lines)
-
-# ===== 给 [主循环] 的 Decision 接口 =====
-# planner.plan 应返回此 dataclass 
-# TODO：预训练模型正则提取得到
-@dataclass(frozen=True) # frozen 只读对象
 class ReActDecision:
-    """One planner decision in the ReAct loop."""
+    """Decision returned to the ReAct main loop for exactly one turn."""
 
     thought: str
     tool_call: ToolCall | None = None
@@ -60,300 +43,329 @@ class ReActDecision:
         return self.final_answer is not None
 
 
-class ImagePlanner:
-    """Plans image enhancement tool chains from natural language requests."""
+@dataclass
+class PlanningHistoryItem:
+    """One ReAct turn kept in planner context."""
 
-    def __init__(self, available_tools: set[str] | None = None) -> None:
-        self.available_tools = available_tools or {
-            "deblur",
-            "denoise",
-            "low_light_enhance",
-            "super_resolution",
-            "color_enhance",
-            "face_restore",
-        }
+    turn: int
+    thought: str
+    tool: ToolCall | None = None
+    final_answer: str | None = None
+    observation: dict[str, Any] | None = None
 
-    def plan(self, user_request: str, input_image: str | Path) -> Plan:
-        request = user_request.lower()
-        image_path = Path(input_image)
-        steps: list[ToolCall] = []
-
-        if self._mentions(request, ["dark", "dim", "low light", "underexposed", "太暗", "暗光"]):
-            steps.append(
-                ToolCall(
-                    tool_name="low_light_enhance",
-                    args={"strength": 0.75},
-                    reason="Improve brightness and recover details in dark regions.",
-                )
-            )
-
-        if self._mentions(request, ["noise", "grain", "noisy", "噪声", "去噪", "颗粒"]):
-            steps.append(
-                ToolCall(
-                    tool_name="denoise",
-                    args={"level": "auto"},
-                    reason="Remove noise before sharpening or super-resolution.",
-                )
-            )
-
-        if self._mentions(request, ["blur", "blurry", "shake", "模糊", "去模糊"]):
-            steps.append(
-                ToolCall(
-                    tool_name="deblur",
-                    args={"mode": "motion_or_defocus"},
-                    reason="Recover edge clarity and reduce blur.",
-                )
-            )
-
-        if self._mentions(request, ["color", "contrast", "vivid", "颜色", "色彩", "对比度"]):
-            steps.append(
-                ToolCall(
-                    tool_name="color_enhance",
-                    args={"balance": "natural", "contrast": "medium"},
-                    reason="Adjust color balance and contrast after restoration.",
-                )
-            )
-
-        if self._mentions(request, ["face", "portrait", "人脸", "肖像"]):
-            steps.append(
-                ToolCall(
-                    tool_name="face_restore",
-                    args={"fidelity": "balanced"},
-                    reason="Restore facial details with a portrait-specific model.",
-                )
-            )
-
-        if self._mentions(request, ["upscale", "super resolution", "enlarge", "高清", "放大", "超分"]):
-            steps.append(
-                ToolCall(
-                    tool_name="super_resolution",
-                    args={"scale": 4},
-                    reason="Increase output resolution as the final enhancement step.",
-                )
-            )
-
-        if not steps:
-            steps.append(
-                ToolCall(
-                    tool_name="color_enhance",
-                    args={"balance": "natural", "contrast": "low"},
-                    reason="Use a conservative general enhancement when no defect is specified.",
-                )
-            )
-
-        steps = self._filter_available_tools(steps)
-        return Plan(
-            user_request=user_request,
-            input_image=image_path,
-            steps=steps,
-            final_goal="Produce an enhanced image that matches the user's request.",
+    @classmethod
+    def from_decision(
+        cls,
+        turn: int,
+        decision: ReActDecision,
+    ) -> PlanningHistoryItem:
+        return cls(
+            turn=turn,
+            thought=decision.thought,
+            tool=decision.tool_call,
+            final_answer=decision.final_answer,
         )
+
+
+PlannerBackend = Literal["openai", "transformers"]
+
+
+class ImagePlanner:
+    """Call a pretrained model and parse its text response into a Decision."""
+
+    DEFAULT_TOOLS = AVAILABLE_TOOL_NAMES
+
+    def __init__(
+        self,
+        backend: PlannerBackend = "transformers",
+        available_tools: set[str] | None = None,
+    ) -> None:
+        if backend not in ("openai", "transformers"):
+            raise ValueError("backend must be either 'openai' or 'transformers'.")
+
+        self.backend = backend
+        self.available_tools = available_tools or set(self.DEFAULT_TOOLS)
+        self.last_prompt = ""
+        self.last_model_output = ""
 
     def next_decision(
         self,
         user_request: str,
         input_image: str | Path,
         current_image: str | Path,
-        completed_steps: list[str],
-        observations: list[dict[str, Any]],
+        planning_history: list[PlanningHistoryItem] | None = None,
     ) -> ReActDecision:
-        """Choose the next ReAct step after observing previous tool outputs."""
+        """Return the next Decision by model generation + regex extraction."""
 
-        plan = self.plan(user_request=user_request, input_image=input_image)
-        completed = set(completed_steps)
-        last_observation = observations[-1] if observations else None
-
-        for step in plan.steps:
-            if step.tool_name not in completed:
-                observation_note = ""
-                if last_observation is not None:
-                    observation_note = (
-                        f" Last observation came from {last_observation['tool_name']} "
-                        f"and produced {last_observation['output_image']}."
-                    )
-                return ReActDecision(
-                    thought=(
-                        f"The request still needs {step.tool_name}.{observation_note} "
-                        f"I will run it next because: {step.reason}"
-                    ),
-                    tool_call=step,
-                )
-
-        return ReActDecision(
-            thought=(
-                "All requested enhancement operations have been completed. "
-                "The latest image is ready to return as the final answer."
-            ),
-            final_answer=(
-                "Final answer: the image enhancement pipeline is complete. "
-                f"The final image is saved at {current_image}."
-            ),
-        )
-
-    @staticmethod
-    def _mentions(text: str, keywords: list[str]) -> bool:
-        return any(keyword in text for keyword in keywords)
-
-    def _filter_available_tools(self, steps: list[ToolCall]) -> list[ToolCall]:
-        return [step for step in steps if step.tool_name in self.available_tools]
-
-
-class TransformerImagePlanner(ImagePlanner):
-    """Planner demo that gets a plan from a Hugging Face transformer model.
-
-    By default this class uses a mock model response, so the demo does not
-    download weights or call a real model. Set use_mock=False after installing
-    transformers and preparing a local/remote model.
-    """
-
-    def __init__(
-        self,
-        model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
-        available_tools: set[str] | None = None,
-        use_mock: bool = True,
-        device: str = "cpu",
-        max_new_tokens: int = 512,
-    ) -> None:
-        super().__init__(available_tools=available_tools)
-        self.model_name = model_name
-        self.use_mock = use_mock
-        self.device = device
-        self.max_new_tokens = max_new_tokens
-        self.last_prompt = ""
-        self.last_model_output = ""
-
-    def plan(self, user_request: str, input_image: str | Path) -> Plan:
-        prompt = self._build_prompt(user_request=user_request, input_image=input_image)
-        model_output = self._generate_plan_text(
-            prompt=prompt,
+        prompt = self._build_prompt(
             user_request=user_request,
             input_image=input_image,
+            current_image=current_image,
+            planning_history=planning_history or [],
+        )
+        model_output = self._generate_text(
+            prompt=prompt,
+            current_image=current_image,
         )
 
         self.last_prompt = prompt
         self.last_model_output = model_output
 
-        return self._parse_model_output(
-            model_output=model_output,
-            user_request=user_request,
-            input_image=input_image,
-        )
+        return self._parse_decision(model_output)
 
-    def _build_prompt(self, user_request: str, input_image: str | Path) -> str:
-        tools = "\n".join(f"- {tool}" for tool in sorted(self.available_tools))
+    def _build_prompt(
+        self,
+        user_request: str,
+        input_image: str | Path,
+        current_image: str | Path,
+        planning_history: list[PlanningHistoryItem] | None = None,
+    ) -> str:
+        tools = "\n".join(f"- {name}" for name in sorted(self.available_tools))
+        planning_history_text = json.dumps(
+            self._history_to_prompt_data(planning_history or []),
+            ensure_ascii=False,
+            indent=2,
+        )
         return f"""You are the planner in an MM-ReAct image enhancement agent.
 
-Your job is to choose an ordered tool plan for the user request.
+Choose exactly one next ReAct step. Use only the listed tools. Review the
+planning history, including previous thoughts, selected tools, and observations,
+before deciding. Keep a coherent plan and do not repeat completed work unless
+the observations justify it.
 
 Available tools:
 {tools}
 
-Input image:
-{input_image}
-
 User request:
 {user_request}
 
-Return JSON only. Do not add markdown. The JSON schema is:
-{{
-  "final_goal": "short description",
-  "steps": [
-    {{
-      "tool_name": "one available tool name",
-      "args": {{}},
-      "reason": "why this tool should run now"
-    }}
-  ]
-}}
+Original input image:
+{input_image}
+
+Current image:
+{current_image}
+
+Planning history:
+{planning_history_text}
+
+Return only this format, with no markdown or extra text:
+<thought>
+short reasoning
+</thought>
+<tools>
+[
+  {{
+    "tool_name": "one available tool name",
+    "args": {{}},
+    "reason": "why this tool should run"
+  }}
+]
+</tools>
+<final_answer>
+empty unless the task is complete
+</final_answer>
 """
 
-    def _generate_plan_text(
+    def _generate_text(
         self,
         prompt: str,
-        user_request: str,
-        input_image: str | Path,
+        current_image: str | Path,
     ) -> str:
-        if self.use_mock:
-            return self._mock_model_output(
-                user_request=user_request,
-                input_image=input_image,
+        if self.backend == "openai":
+            return self._generate_with_openai_api(
+                prompt=prompt,
+                current_image=current_image,
             )
-        return self._generate_with_transformers(prompt)
+        return self._generate_with_transformers(
+            prompt=prompt,
+            current_image=current_image,
+        )
 
-    def _generate_with_transformers(self, prompt: str) -> str:
-        """Real transformer call skeleton. Not used by the default demo."""
+    def _generate_with_openai_api(
+        self,
+        prompt: str,
+        current_image: str | Path,
+    ) -> str:
+        from openai import OpenAI
 
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        model_name = os.getenv("MM_REACT_OPENAI_MODEL", "gpt-4o-mini")
+        max_output_tokens = int(
+            os.getenv(
+                "MM_REACT_OPENAI_MAX_OUTPUT_TOKENS",
+                os.getenv("MM_REACT_OPENAI_MAX_TOKENS", "512"),
+            )
+        )
+        temperature = float(os.getenv("MM_REACT_OPENAI_TEMPERATURE", "0"))
+        image_detail = os.getenv("MM_REACT_OPENAI_IMAGE_DETAIL", "auto")
 
-        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        model = AutoModelForCausalLM.from_pretrained(self.model_name)
-        model.to(self.device)
+        client = OpenAI()
+        response = client.responses.create(
+            model=model_name,
+            instructions=(
+                "You are the planner for an MM-ReAct image enhancement agent. "
+                "Use the current image input and return only the requested XML-like "
+                "sections."
+            ),
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_text", "text": "Current image:"},
+                        {
+                            "type": "input_image",
+                            "image_url": self._image_to_data_url(current_image),
+                            "detail": image_detail,
+                        },
+                    ],
+                },
+            ],
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+        )
 
-        inputs = tokenizer(prompt, return_tensors="pt").to(self.device)
+        content = response.output_text
+        if not content:
+            raise ValueError("OpenAI API returned an empty planner response.")
+        return content
+
+    def _generate_with_transformers(
+        self,
+        prompt: str,
+        current_image: str | Path,
+    ) -> str:
+        try:
+            from transformers import AutoModelForImageTextToText, AutoProcessor
+        except ImportError:
+            from transformers import AutoProcessor
+            from transformers import (
+                AutoModelForVision2Seq as AutoModelForImageTextToText,
+            )
+
+        model_name = os.getenv(
+            "MM_REACT_TRANSFORMERS_MODEL",
+            "Qwen/Qwen2.5-VL-3B-Instruct",
+        )
+        device = os.getenv("MM_REACT_TRANSFORMERS_DEVICE", "cpu")
+        max_new_tokens = int(os.getenv("MM_REACT_TRANSFORMERS_MAX_NEW_TOKENS", "512"))
+        trust_remote_code = (
+            os.getenv("MM_REACT_TRANSFORMERS_TRUST_REMOTE_CODE", "false").lower()
+            == "true"
+        )
+
+        processor = AutoProcessor.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+        )
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+        ).to(device)
+        model.eval()
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        if hasattr(processor, "apply_chat_template"):
+            text = processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            text = prompt
+        image = self._load_image(current_image)
+        inputs = processor(
+            text=[text],
+            images=image,
+            return_tensors="pt",
+        ).to(device)
         outputs = model.generate(
             **inputs,
-            max_new_tokens=self.max_new_tokens,
+            max_new_tokens=max_new_tokens,
             do_sample=False,
         )
 
         prompt_length = inputs["input_ids"].shape[-1]
         generated_tokens = outputs[0][prompt_length:]
-        return tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        return processor.decode(generated_tokens, skip_special_tokens=True)
 
-    def _mock_model_output(self, user_request: str, input_image: str | Path) -> str:
-        rule_plan = super().plan(user_request=user_request, input_image=input_image)
-        return json.dumps(
-            {
-                "final_goal": rule_plan.final_goal,
-                "steps": [
-                    {
-                        "tool_name": step.tool_name,
-                        "args": step.args,
-                        "reason": step.reason,
-                    }
-                    for step in rule_plan.steps
-                ],
-            },
-            ensure_ascii=False,
-            indent=2,
+    def _parse_decision(self, text: str) -> ReActDecision:
+        thought = self._extract_tag(text, "thought")
+        tools_text = self._extract_tag(text, "tools")
+        final_answer = self._extract_tag(text, "final_answer")
+        tool_items = json.loads(tools_text)
+
+        if not isinstance(tool_items, list):
+            raise ValueError("<tools> must contain a JSON array.")
+
+        if final_answer:
+            if tool_items:
+                raise ValueError("A final decision cannot contain tool calls.")
+            return ReActDecision(thought=thought, final_answer=final_answer)
+
+        if not tool_items:
+            raise ValueError("A non-final decision must contain one tool call.")
+
+        tool_call = self._parse_tool_call(tool_items[0], fallback_reason=thought)
+        return ReActDecision(thought=thought, tool_call=tool_call)
+
+    def _parse_tool_call(
+        self,
+        item: dict[str, Any],
+        fallback_reason: str,
+    ) -> ToolCall:
+        if not isinstance(item, dict):
+            raise ValueError("Each tool call must be a JSON object.")
+
+        tool_name = item["tool_name"]
+        if tool_name not in self.available_tools:
+            raise ValueError(f"Unknown tool from model output: {tool_name}")
+
+        args = item.get("args", {})
+        if not isinstance(args, dict):
+            raise ValueError("Tool args must be a JSON object.")
+
+        return ToolCall(
+            tool_name=tool_name,
+            args=args,
+            reason=item.get("reason", fallback_reason),
         )
 
-    def _parse_model_output(
-        self,
-        model_output: str,
-        user_request: str,
-        input_image: str | Path,
-    ) -> Plan:
-        try:
-            payload = json.loads(self._extract_json_object(model_output))
-            steps = [
-                ToolCall(
-                    tool_name=item["tool_name"],
-                    args=item.get("args", {}),
-                    reason=item.get("reason", ""),
-                )
-                for item in payload.get("steps", [])
-                if item.get("tool_name") in self.available_tools
-            ]
-            if not steps:
-                raise ValueError("Model output did not contain valid tool steps.")
-
-            return Plan(
-                user_request=user_request,
-                input_image=Path(input_image),
-                steps=steps,
-                final_goal=payload.get(
-                    "final_goal",
-                    "Produce an enhanced image that matches the user's request.",
-                ),
-            )
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            return super().plan(user_request=user_request, input_image=input_image)
+    @staticmethod
+    def _extract_tag(text: str, tag_name: str) -> str:
+        pattern = rf"<{tag_name}>\s*(.*?)\s*</{tag_name}>"
+        match = re.search(pattern, text, flags=re.DOTALL | re.IGNORECASE)
+        if match is None:
+            raise ValueError(f"Missing <{tag_name}> section in model output.")
+        return match.group(1).strip()
 
     @staticmethod
-    def _extract_json_object(text: str) -> str:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise ValueError("No JSON object found in model output.")
-        return text[start : end + 1]
+    def _history_to_prompt_data(
+        planning_history: list[PlanningHistoryItem],
+    ) -> list[dict[str, Any]]:
+        return [asdict(item) for item in planning_history]
+
+    @staticmethod
+    def _image_to_data_url(image_path: str | Path) -> str:
+        image_ref = str(image_path)
+        if image_ref.startswith(("http://", "https://", "data:")):
+            return image_ref
+
+        path = Path(image_path)
+        mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
+    @staticmethod
+    def _load_image(image_path: str | Path) -> Any:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            return image.convert("RGB")
