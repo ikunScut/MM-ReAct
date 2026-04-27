@@ -1,0 +1,4 @@
+This is a mock image artifact for the MM-ReAct demo.
+input_image=outputs/images/demo.s1_low_light_enhance.s2_denoise.jpg
+tool_name=deblur
+args={'mode': 'motion_or_defocus'}
