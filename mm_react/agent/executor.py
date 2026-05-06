@@ -1,17 +1,16 @@
 """Executor demo for MM-ReAct image enhancement steps.
 
 The ReAct loop gives the executor one ToolCall at a time. This demo uses mock
-tools that only create output paths and metadata. Real image enhancement models
+tools that only create output paths and observations. Real image enhancement models
 can be plugged in by passing a custom tool_registry.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-from ..tools import DEFAULT_TOOL_REGISTRY, ToolFn
+from ..tools import DEFAULT_TOOL_REGISTRY, ToolFn, ToolObservation
 from .memory import AgentMemory
 from .planner import ToolCall
 
@@ -22,8 +21,8 @@ class StepResult:
 
     tool_name: str
     input_image: Path
-    output_image: Path
-    metadata: dict[str, Any] = field(default_factory=dict)
+    output_image: Path | None
+    observation: ToolObservation
 
 
 class ImageExecutor:
@@ -63,22 +62,31 @@ class ImageExecutor:
             tool_name=tool_call.tool_name,
             step_index=step_index,
         )
-        metadata = tool(input_path, tool_call, output_image)
+        previous_output_stat = output_image.stat() if output_image.exists() else None
+        observation = tool(input_path, tool_call, output_image)
+        output_was_created = False
+        if output_image.exists():
+            current_output_stat = output_image.stat()
+            output_was_created = previous_output_stat is None or (
+                current_output_stat.st_mtime_ns != previous_output_stat.st_mtime_ns
+                or current_output_stat.st_size != previous_output_stat.st_size
+            )
+        result_output_image = output_image if output_was_created else None
 
         if memory is not None:
             memory.add_tool_result(
                 step_index=step_index,
                 tool_name=tool_call.tool_name,
                 input_image=input_path,
-                output_image=output_image,
-                metadata=metadata,
+                output_image=result_output_image,
+                observation=observation,
             )
 
         return StepResult(
             tool_name=tool_call.tool_name,
             input_image=input_path,
-            output_image=output_image,
-            metadata=metadata,
+            output_image=result_output_image,
+            observation=observation,
         )
 
     def _make_output_path(

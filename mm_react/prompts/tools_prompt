@@ -2,142 +2,21 @@ Available Tools
 ===============
 
 - Tool Name: `low_light_enhance`
+  Backend: Zero-DCE
   Description: Enhance underexposed or low-light images while preserving natural brightness, contrast, and color.
   When To Use: Use when the image is too dark, underexposed, or lacks shadow details.
-  When Not To Use: Do not use when the image is already normally exposed or only needs denoising, deblurring, or upscaling.
+  When Not To Use: Do not use when the image is already normally exposed or when the user asks for denoising, deblurring, upscaling, face restoration, or color editing that Zero-DCE does not provide.
   Input Schema:
     {
-      "image_path": {"type": "string", "description": "Path to the input image."},
-      "strength": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.75, "description": "Enhancement strength."}
+      "image_path": {"type": "string", "description": "Path to the input image."}
     }
   Output Schema:
     {
       "output_image": {"type": "string", "description": "Path to the enhanced image."},
-      "metadata": {"type": "object", "description": "Runtime details and quality measurements."}
+      "observation": {"type": "string", "description": "Brief result observation for the planner."}
     }
   Example:
     {
       "tool_name": "low_light_enhance",
-      "args": {"strength": 0.75}
-    }
-
-- Tool Name: `denoise`
-  Description: Remove noise, grain, and compression artifacts from an image.
-  When To Use: Use when the image contains visible noise, grain, high-ISO artifacts, or compression artifacts.
-  When Not To Use: Do not use aggressively on clean images, as it may remove texture and fine details.
-  Input Schema:
-    {
-      "image_path": {"type": "string", "description": "Path to the input image."},
-      "level": {"type": "string", "enum": ["low", "medium", "high", "auto"], "default": "auto", "description": "Denoising strength."}
-    }
-  Output Schema:
-    {
-      "output_image": {"type": "string", "description": "Path to the denoised image."},
-      "metadata": {"type": "object", "description": "Runtime details and quality measurements."}
-    }
-  Example:
-    {
-      "tool_name": "denoise",
-      "args": {"level": "auto"}
-    }
-
-- Tool Name: `deblur`
-  Description: Recover sharpness from motion blur, defocus blur, or mild camera shake.
-  When To Use: Use when the image looks blurry, out of focus, smeared, or affected by camera shake.
-  When Not To Use: Do not use for images that are already sharp or only need resolution upscaling.
-  Input Schema:
-    {
-      "image_path": {"type": "string", "description": "Path to the input image."},
-      "mode": {"type": "string", "enum": ["motion", "defocus", "motion_or_defocus", "auto"], "default": "auto", "description": "Blur type."}
-    }
-  Output Schema:
-    {
-      "output_image": {"type": "string", "description": "Path to the deblurred image."},
-      "metadata": {"type": "object", "description": "Runtime details and quality measurements."}
-    }
-  Example:
-    {
-      "tool_name": "deblur",
-      "args": {"mode": "motion_or_defocus"}
-    }
-
-- Tool Name: `super_resolution`
-  Description: Upscale an image and recover high-frequency details.
-  When To Use: Use when the user asks for higher resolution, enlargement, HD output, or super-resolution.
-  When Not To Use: Do not use before denoising or deblurring if the image contains strong noise or blur.
-  Input Schema:
-    {
-      "image_path": {"type": "string", "description": "Path to the input image."},
-      "scale": {"type": "integer", "enum": [2, 4], "default": 4, "description": "Upscaling factor."}
-    }
-  Output Schema:
-    {
-      "output_image": {"type": "string", "description": "Path to the upscaled image."},
-      "metadata": {"type": "object", "description": "Runtime details and quality measurements."}
-    }
-  Example:
-    {
-      "tool_name": "super_resolution",
-      "args": {"scale": 4}
-    }
-
-- Tool Name: `color_enhance`
-  Description: Adjust color balance, saturation, white balance, and contrast.
-  When To Use: Use when the image has dull colors, incorrect white balance, low contrast, or the user requests more vivid/natural colors.
-  When Not To Use: Do not use when the image only needs structural restoration such as denoising, deblurring, or face restoration.
-  Input Schema:
-    {
-      "image_path": {"type": "string", "description": "Path to the input image."},
-      "balance": {"type": "string", "enum": ["natural", "vivid", "warm", "cool"], "default": "natural", "description": "Color style."},
-      "contrast": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium", "description": "Contrast strength."}
-    }
-  Output Schema:
-    {
-      "output_image": {"type": "string", "description": "Path to the color-enhanced image."},
-      "metadata": {"type": "object", "description": "Runtime details and quality measurements."}
-    }
-  Example:
-    {
-      "tool_name": "color_enhance",
-      "args": {"balance": "natural", "contrast": "medium"}
-    }
-
-- Tool Name: `face_restore`
-  Description: Restore facial details in portraits, old photos, or low-quality face images.
-  When To Use: Use when the image contains human faces that are blurry, low-resolution, old, or degraded.
-  When Not To Use: Do not use for images without visible faces or when preserving exact identity is more important than restoration strength.
-  Input Schema:
-    {
-      "image_path": {"type": "string", "description": "Path to the input image."},
-      "fidelity": {"type": "string", "enum": ["conservative", "balanced", "strong"], "default": "balanced", "description": "Identity preservation versus restoration strength."}
-    }
-  Output Schema:
-    {
-      "output_image": {"type": "string", "description": "Path to the face-restored image."},
-      "metadata": {"type": "object", "description": "Runtime details and quality measurements."}
-    }
-  Example:
-    {
-      "tool_name": "face_restore",
-      "args": {"fidelity": "balanced"}
-    }
-
-- Tool Name: `image_quality_assess`
-  Description: Assess image quality and report brightness, noise, blur, color, and resolution indicators.
-  When To Use: Use when the next action is uncertain, or when the agent needs evidence before deciding whether to continue or finish.
-  When Not To Use: Do not use repeatedly if the previous observation already contains enough quality information.
-  Input Schema:
-    {
-      "image_path": {"type": "string", "description": "Path to the input image."},
-      "metrics": {"type": "array", "items": {"type": "string", "enum": ["brightness", "noise", "blur", "color", "resolution", "all"]}, "default": ["all"], "description": "Quality metrics to compute."}
-    }
-  Output Schema:
-    {
-      "quality_report": {"type": "object", "description": "Measured quality indicators."},
-      "metadata": {"type": "object", "description": "Runtime details and metric configuration."}
-    }
-  Example:
-    {
-      "tool_name": "image_quality_assess",
-      "args": {"metrics": ["all"]}
+      "args": {}
     }

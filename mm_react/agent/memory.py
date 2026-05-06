@@ -68,18 +68,21 @@ class AgentMemory:
         step_index: int,
         tool_name: str,
         input_image: Path,
-        output_image: Path,
-        metadata: dict[str, Any],
+        output_image: Path | None,
+        observation: Any,
     ) -> None:
+        data = {
+            "tool_name": tool_name,
+            "input_image": str(input_image),
+            "observation": observation,
+        }
+        if output_image is not None:
+            data["output_image"] = str(output_image)
+
         self.add(
             event_type="observation",
             message=f"Tool {step_index} finished: {tool_name}.",
-            data={
-                "tool_name": tool_name,
-                "input_image": str(input_image),
-                "output_image": str(output_image),
-                "metadata": metadata,
-            },
+            data=data,
         )
 
     def add_final_result(self, output_image: Path) -> None:

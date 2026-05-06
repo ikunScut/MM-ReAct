@@ -3,7 +3,7 @@
 核心流程只有一条：
 1. planner 构造 prompt；
 2. 调用预训练模型得到文本回复；
-3. 用正则提取 <thought>、<tools>、<final_answer>；
+3. 用正则提取 <thought>、<tool>、<final_answer>；
 4. 归一化为 ReActDecision，交给主循环执行。
 """
 
@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ..tools import AVAILABLE_TOOL_NAMES
+
+PROMPTS_DIR = Path(__file__).resolve().parents[1] / "prompts"
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,9 @@ class ImagePlanner:
 
         self.backend = backend
         self.available_tools = available_tools or set(self.DEFAULT_TOOLS)
+        self.system_prompt = self._load_prompt("system_prompt")
+        self.tools_prompt = self._load_prompt("tools_prompt")
+        self.output_format_prompt = self._load_prompt("output_format_prompt")
         self.last_prompt = ""
         self.last_model_output = ""
 
@@ -120,21 +125,13 @@ class ImagePlanner:
         current_image: str | Path,
         planning_history: list[PlanningHistoryItem] | None = None,
     ) -> str:
-        tools = "\n".join(f"- {name}" for name in sorted(self.available_tools))
         planning_history_text = json.dumps(
             self._history_to_prompt_data(planning_history or []),
             ensure_ascii=False,
             indent=2,
         )
-        return f"""You are the planner in an MM-ReAct image enhancement agent.
-
-Choose exactly one next ReAct step. Use only the listed tools. Review the
-planning history, including previous thoughts, selected tools, and observations,
-before deciding. Keep a coherent plan and do not repeat completed work unless
-the observations justify it.
-
-Available tools:
-{tools}
+        runtime_context = f"""Runtime Context
+===============
 
 User request:
 {user_request}
@@ -147,24 +144,15 @@ Current image:
 
 Planning history:
 {planning_history_text}
-
-Return only this format, with no markdown or extra text:
-<thought>
-short reasoning
-</thought>
-<tools>
-[
-  {{
-    "tool_name": "one available tool name",
-    "args": {{}},
-    "reason": "why this tool should run"
-  }}
-]
-</tools>
-<final_answer>
-empty unless the task is complete
-</final_answer>
 """
+        return "\n\n".join(
+            (
+                self.system_prompt,
+                self.tools_prompt,
+                runtime_context,
+                self.output_format_prompt,
+            )
+        )
 
     def _generate_text(
         self,
@@ -188,7 +176,13 @@ empty unless the task is complete
     ) -> str:
         from openai import OpenAI
 
-        model_name = os.getenv("MM_REACT_OPENAI_MODEL", "gpt-4o-mini")
+        base_url = os.getenv("MM_REACT_OPENAI_BASE_URL") or os.getenv(
+            "OPENAI_BASE_URL"
+        )
+        model_name = os.getenv(
+            "MM_REACT_OPENAI_MODEL",
+            "/model" if base_url else "gpt-4o-mini",
+        )
         max_output_tokens = int(
             os.getenv(
                 "MM_REACT_OPENAI_MAX_OUTPUT_TOKENS",
@@ -196,16 +190,66 @@ empty unless the task is complete
             )
         )
         temperature = float(os.getenv("MM_REACT_OPENAI_TEMPERATURE", "0"))
+        top_p = float(os.getenv("MM_REACT_OPENAI_TOP_P", "1"))
+        presence_penalty = float(os.getenv("MM_REACT_OPENAI_PRESENCE_PENALTY", "0"))
+        top_k = os.getenv("MM_REACT_OPENAI_TOP_K")
         image_detail = os.getenv("MM_REACT_OPENAI_IMAGE_DETAIL", "auto")
+        api_type = os.getenv(
+            "MM_REACT_OPENAI_API_TYPE",
+            "chat_completions" if base_url else "responses",
+        )
+        send_image = self._env_flag("MM_REACT_OPENAI_SEND_IMAGE", default=True)
 
-        client = OpenAI()
+        client_kwargs = {}
+        api_key = os.getenv("MM_REACT_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+        if base_url:
+            client_kwargs["base_url"] = base_url
+            client_kwargs["api_key"] = api_key or "EMPTY"
+        elif api_key:
+            client_kwargs["api_key"] = api_key
+
+        client = OpenAI(**client_kwargs)
+
+        if api_type in {"chat", "chat.completions", "chat_completions"}:
+            if send_image:
+                content: str | list[dict[str, Any]] = [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": self._image_to_data_url(current_image),
+                            "detail": image_detail,
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ]
+            else:
+                content = prompt
+
+            request_kwargs = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": content},
+                ],
+                "max_tokens": max_output_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "presence_penalty": presence_penalty,
+            }
+            if top_k is not None:
+                request_kwargs["extra_body"] = {"top_k": int(top_k)}
+
+            response = client.chat.completions.create(**request_kwargs)
+            text = self._normalize_openai_message_content(
+                response.choices[0].message.content
+            )
+            if not text:
+                raise ValueError("OpenAI-compatible API returned an empty response.")
+            return text
+
         response = client.responses.create(
             model=model_name,
-            instructions=(
-                "You are the planner for an MM-ReAct image enhancement agent. "
-                "Use the current image input and return only the requested XML-like "
-                "sections."
-            ),
+            instructions=self.system_prompt,
             input=[
                 {
                     "role": "user",
@@ -228,6 +272,31 @@ empty unless the task is complete
         if not content:
             raise ValueError("OpenAI API returned an empty planner response.")
         return content
+
+    @staticmethod
+    def _env_flag(name: str, default: bool = False) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _normalize_openai_message_content(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+                elif hasattr(item, "text") and isinstance(item.text, str):
+                    parts.append(item.text)
+            return "\n".join(parts).strip()
+        return str(content)
 
     def _generate_with_transformers(
         self,
@@ -298,22 +367,26 @@ empty unless the task is complete
 
     def _parse_decision(self, text: str) -> ReActDecision:
         thought = self._extract_tag(text, "thought")
-        tools_text = self._extract_tag(text, "tools")
+        tool_text = self._extract_tag(text, "tool")
         final_answer = self._extract_tag(text, "final_answer")
-        tool_items = json.loads(tools_text)
+        tool_item = json.loads(tool_text)
 
-        if not isinstance(tool_items, list):
-            raise ValueError("<tools> must contain a JSON array.")
+        if isinstance(tool_item, list):
+            raise ValueError(
+                "<tool> must contain one JSON object or null, not a JSON array."
+            )
+        if tool_item is not None and not isinstance(tool_item, dict):
+            raise ValueError("<tool> must contain one JSON object or null.")
 
         if final_answer:
-            if tool_items:
+            if tool_item is not None:
                 raise ValueError("A final decision cannot contain tool calls.")
             return ReActDecision(thought=thought, final_answer=final_answer)
 
-        if not tool_items:
+        if tool_item is None:
             raise ValueError("A non-final decision must contain one tool call.")
 
-        tool_call = self._parse_tool_call(tool_items[0], fallback_reason=thought)
+        tool_call = self._parse_tool_call(tool_item, fallback_reason=thought)
         return ReActDecision(thought=thought, tool_call=tool_call)
 
     def _parse_tool_call(
@@ -337,6 +410,10 @@ empty unless the task is complete
             args=args,
             reason=item.get("reason", fallback_reason),
         )
+
+    @staticmethod
+    def _load_prompt(prompt_name: str) -> str:
+        return (PROMPTS_DIR / prompt_name).read_text(encoding="utf-8").strip()
 
     @staticmethod
     def _extract_tag(text: str, tag_name: str) -> str:

@@ -1,4 +1,4 @@
-"""Demo tool implementation used by the executor registry."""
+"""Zero-DCE expert tool wrapper."""
 
 from __future__ import annotations
 
@@ -9,26 +9,26 @@ from pathlib import Path
 from typing import Any
 
 
-DEMO_CONDA_ENV = os.environ.get("MM_REACT_DEMO_CONDA_ENV", "base")
+ZERODCE_CONDA_ENV = os.environ.get("MM_REACT_ZERODCE_CONDA_ENV", "zerodce")
 CONDA_EXECUTABLE = os.environ.get("MM_REACT_CONDA", "conda")
-TOOL_TIMEOUT_SECONDS = int(os.environ.get("MM_REACT_TOOL_TIMEOUT_SECONDS", "300"))
+TOOL_TIMEOUT_SECONDS = int(os.environ.get("MM_REACT_TOOL_TIMEOUT_SECONDS", "900"))
 
 
-def run_demo_tool(
+def run_zerodce_tool(
     input_image: Path, tool_call: Any, output_image: Path
 ) -> str:
-    """Run the demo model through conda and return an execution observation."""
+    """Run Zero-DCE through conda and return an execution observation."""
 
     output_image.parent.mkdir(parents=True, exist_ok=True)
     project_root = Path(__file__).resolve().parents[2]
-    model_script = project_root / "image_enhancement_experts" / "demo" / "entrypoint.py"
+    model_script = project_root / "experts" / "Zero-DCE" / "entrypoint.py"
     tool_args = dict(tool_call.args)
 
     cmd = [
         CONDA_EXECUTABLE,
         "run",
         "-n",
-        DEMO_CONDA_ENV,
+        ZERODCE_CONDA_ENV,
         "python",
         str(model_script),
         "--input",
@@ -49,9 +49,17 @@ def run_demo_tool(
         )
     except FileNotFoundError as exc:
         raise RuntimeError(f"Could not find conda executable: {CONDA_EXECUTABLE}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "Zero-DCE tool timed out.\n"
+            f"command={cmd}\n"
+            f"timeout_seconds={TOOL_TIMEOUT_SECONDS}\n"
+            f"stdout={exc.stdout}\n"
+            f"stderr={exc.stderr}"
+        ) from exc
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
-            "demo tool failed.\n"
+            "Zero-DCE tool failed.\n"
             f"command={cmd}\n"
             f"stdout={exc.stdout}\n"
             f"stderr={exc.stderr}"

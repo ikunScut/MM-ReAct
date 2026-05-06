@@ -84,10 +84,13 @@ class ReActAgent:
             history_item.observation = {
                 "tool_name": step_result.tool_name,
                 "input_image": str(step_result.input_image),
-                "output_image": str(step_result.output_image),
-                "metadata": step_result.metadata,
+                "observation": step_result.observation,
             }
-            current_image = step_result.output_image
+            if step_result.output_image is not None:
+                history_item.observation["output_image"] = str(
+                    step_result.output_image
+                )
+                current_image = step_result.output_image
 
         final_answer = (
             "Final answer: stopped because the maximum number of ReAct turns "
