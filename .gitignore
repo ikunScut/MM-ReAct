@@ -1,0 +1,15 @@
+.env.local
+.env
+.DS_Store
+__pycache__/
+*.py[cod]
+*.pyc
+*.bak
+*~
+.vscode/
+outputs/
+image.png
+data/VizWiz/images/
+data/VizWiz/annotations/
+data/VizWiz/VQA_test.json
+data/VizWiz/API/**/.git/

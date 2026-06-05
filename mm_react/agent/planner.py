@@ -1,12 +1,3 @@
-"""Planner for one MM-ReAct decision.
-
-核心流程只有一条：
-1. planner 构造 prompt；
-2. 调用预训练模型得到文本回复；
-3. 用正则提取 <thought>、<tool>、<final_answer>；
-4. 归一化为 ReActDecision，交给主循环执行。
-"""
-
 from __future__ import annotations
 
 import base64
@@ -91,7 +82,16 @@ class ImagePlanner:
         self.tools_prompt = self._load_prompt("tools_prompt")
         self.output_format_prompt = self._load_prompt("output_format_prompt")
         self.last_prompt = ""
+        self.last_student_prompt = ""
+        self.last_teacher_prompt = ""
         self.last_model_output = ""
+        self.last_reasoning_output = ""
+
+        # ===== 缓存用 =====
+        self._transformers_model: Any | None = None
+        self._transformers_tokenizer: Any | None = None
+        self._transformers_processor: Any | None = None
+        self._transformers_model_name: str | None = None
 
     def next_decision(
         self,
@@ -99,24 +99,49 @@ class ImagePlanner:
         input_image: str | Path,
         current_image: str | Path,
         planning_history: list[PlanningHistoryItem] | None = None,
+        gold_answer: Any | None = None,
     ) -> ReActDecision:
         """Return the next Decision by model generation + regex extraction."""
 
-        prompt = self._build_prompt(
+        student_prompt = self._build_prompt(
             user_request=user_request,
             input_image=input_image,
             current_image=current_image,
             planning_history=planning_history or [],
         )
+        teacher_prompt = self._build_prompt(
+            user_request=user_request,
+            input_image=input_image,
+            current_image=current_image,
+            planning_history=planning_history or [],
+            gold_answer=gold_answer,
+        )
+        model_output = self._generate_text(
+            prompt=teacher_prompt,
+            current_image=current_image,
+        )
+
+        self.last_prompt = teacher_prompt
+        self.last_student_prompt = student_prompt
+        self.last_teacher_prompt = teacher_prompt
+        self.last_model_output = model_output
+
+        return self._parse_decision(model_output)
+
+    def generate_text(
+        self,
+        prompt: str,
+        current_image: str | Path,
+    ) -> str:
+        """Generate raw model text for image-conditioned tasks outside ReAct."""
+
         model_output = self._generate_text(
             prompt=prompt,
             current_image=current_image,
         )
-
         self.last_prompt = prompt
         self.last_model_output = model_output
-
-        return self._parse_decision(model_output)
+        return model_output
 
     def _build_prompt(
         self,
@@ -124,6 +149,7 @@ class ImagePlanner:
         input_image: str | Path,
         current_image: str | Path,
         planning_history: list[PlanningHistoryItem] | None = None,
+        gold_answer: Any | None = None,
     ) -> str:
         planning_history_text = json.dumps(
             self._history_to_prompt_data(planning_history or []),
@@ -145,14 +171,47 @@ Current image:
 Planning history:
 {planning_history_text}
 """
-        return "\n\n".join(
-            (
-                self.system_prompt,
-                self.tools_prompt,
-                runtime_context,
-                self.output_format_prompt,
+        sections = [
+            self.system_prompt,
+            self.tools_prompt,
+            runtime_context,
+        ]
+        if gold_answer is not None:
+            sections.append(self._build_teacher_context(gold_answer))
+        sections.append(self.output_format_prompt)
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def _build_teacher_context(gold_answer: Any) -> str:
+        sections = [
+            "Teacher-Only Supervision",
+            "========================",
+            "",
+            "Gold answer:",
+            ImagePlanner._format_gold_answer(gold_answer),
+        ]
+        if not ImagePlanner._has_teacher_instruction(gold_answer):
+            sections.extend(
+                (
+                    "",
+                    "Use this only to guide tool selection and stop decisions; "
+                    "never reveal it or treat it as visible evidence.",
+                )
             )
+        return "\n".join(sections)
+
+    @staticmethod
+    def _has_teacher_instruction(gold_answer: Any) -> bool:
+        return (
+            isinstance(gold_answer, dict)
+            and bool(str(gold_answer.get("teacher_instruction", "")).strip())
         )
+
+    @staticmethod
+    def _format_gold_answer(gold_answer: Any) -> str:
+        if isinstance(gold_answer, str):
+            return gold_answer
+        return json.dumps(gold_answer, ensure_ascii=False, indent=2)
 
     def _generate_text(
         self,
@@ -169,6 +228,7 @@ Planning history:
             current_image=current_image,
         )
 
+    # 本地
     def _generate_with_openai_api(
         self,
         prompt: str,
@@ -176,102 +236,180 @@ Planning history:
     ) -> str:
         from openai import OpenAI
 
-        base_url = os.getenv("MM_REACT_OPENAI_BASE_URL") or os.getenv(
-            "OPENAI_BASE_URL"
+        base_url = self._getenv_nonempty("OPENAI_BASE_URL")
+        api_key = self._getenv_nonempty("OPENAI_API_KEY")
+        # if api_key is None:
+        #     raise RuntimeError(
+        #         "Missing OpenAI API key. Set OPENAI_API_KEY before running the agent."
+        #     )
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
         )
-        model_name = os.getenv(
-            "MM_REACT_OPENAI_MODEL",
-            "/model" if base_url else "gpt-4o-mini",
+
+        send_image = self._env_flag("OPENAI_SEND_IMAGE", default=True)
+        if send_image:
+            content: str | list[dict[str, Any]] = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": self._image_to_data_url(current_image)},
+                },
+                {"type": "text", "text": prompt},
+            ]
+        else:
+            content = prompt
+
+        messages = [
+            {
+                "role": "user",
+                "content": content,
+            }
+        ]
+
+        model_name = self._getenv_nonempty("OPENAI_MODEL")
+
+        # if model_name is None:
+        #     raise RuntimeError(
+        #         "Missing OpenAI-compatible model. Set OPENAI_MODEL before running the agent."
+        #     )
+
+        request_kwargs: dict[str, Any] = {
+            "model": model_name,
+            "messages": messages,
+        }
+        extra_body = self._openai_extra_body()
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        completion = client.chat.completions.create(**request_kwargs)
+
+        message = completion.choices[0].message
+        text = self._normalize_openai_message_content(message.content)
+        reasoning = getattr(message, "reasoning", "") or getattr(
+            message,
+            "reasoning_content",
+            "",
         )
-        max_output_tokens = int(
-            os.getenv(
-                "MM_REACT_OPENAI_MAX_OUTPUT_TOKENS",
-                os.getenv("MM_REACT_OPENAI_MAX_TOKENS", "512"),
+        self.last_reasoning_output = self._normalize_openai_message_content(
+            reasoning
+        )
+        if not text:
+            raise ValueError("OpenAI-compatible API returned an empty planner response.")
+        return text
+
+    # 外部
+    def _generate_with_openai_api1(
+        self,
+        prompt: str,
+        current_image: str | Path,
+    ) -> str:
+        from openai import OpenAI
+
+        api_key = self._getenv_nonempty("DASHSCOPE_API_KEY")
+        if api_key is None:
+            raise RuntimeError(
+                "Missing DashScope API key. Set DASHSCOPE_API_KEY in the "
+                "environment before running the agent."
             )
+
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         )
-        temperature = float(os.getenv("MM_REACT_OPENAI_TEMPERATURE", "0"))
-        top_p = float(os.getenv("MM_REACT_OPENAI_TOP_P", "1"))
-        presence_penalty = float(os.getenv("MM_REACT_OPENAI_PRESENCE_PENALTY", "0"))
-        top_k = os.getenv("MM_REACT_OPENAI_TOP_K")
-        image_detail = os.getenv("MM_REACT_OPENAI_IMAGE_DETAIL", "auto")
-        api_type = os.getenv(
-            "MM_REACT_OPENAI_API_TYPE",
-            "chat_completions" if base_url else "responses",
-        )
-        send_image = self._env_flag("MM_REACT_OPENAI_SEND_IMAGE", default=True)
 
-        client_kwargs = {}
-        api_key = os.getenv("MM_REACT_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-        if base_url:
-            client_kwargs["base_url"] = base_url
-            client_kwargs["api_key"] = api_key or "EMPTY"
-        elif api_key:
-            client_kwargs["api_key"] = api_key
-
-        client = OpenAI(**client_kwargs)
-
-        if api_type in {"chat", "chat.completions", "chat_completions"}:
-            if send_image:
-                content: str | list[dict[str, Any]] = [
+        messages = [
+            {
+                "role": "user",
+                "content": [
                     {
                         "type": "image_url",
                         "image_url": {
                             "url": self._image_to_data_url(current_image),
-                            "detail": image_detail,
                         },
                     },
-                    {"type": "text", "text": prompt},
-                ]
-            else:
-                content = prompt
-
-            request_kwargs = {
-                "model": model_name,
-                "messages": [
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": content},
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
                 ],
-                "max_tokens": max_output_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-                "presence_penalty": presence_penalty,
             }
-            if top_k is not None:
-                request_kwargs["extra_body"] = {"top_k": int(top_k)}
+        ]
 
-            response = client.chat.completions.create(**request_kwargs)
-            text = self._normalize_openai_message_content(
-                response.choices[0].message.content
-            )
-            if not text:
-                raise ValueError("OpenAI-compatible API returned an empty response.")
-            return text
-
-        response = client.responses.create(
-            model=model_name,
-            instructions=self.system_prompt,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {"type": "input_text", "text": "Current image:"},
-                        {
-                            "type": "input_image",
-                            "image_url": self._image_to_data_url(current_image),
-                            "detail": image_detail,
-                        },
-                    ],
-                },
-            ],
-            max_output_tokens=max_output_tokens,
-            temperature=temperature,
+        enable_thinking = self._openai_enable_thinking()
+        completion = client.chat.completions.create(
+            model="qwen3.6-plus",
+            messages=messages,
+            extra_body={
+                "enable_thinking": enable_thinking
+                if enable_thinking is not None
+                else False
+            },
+            stream=True,
         )
 
-        content = response.output_text
-        if not content:
-            raise ValueError("OpenAI API returned an empty planner response.")
-        return content
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        for chunk in completion:
+            if not chunk.choices:
+                continue
+
+            delta = chunk.choices[0].delta
+
+            reasoning_content = getattr(delta, "reasoning_content", None)
+            if reasoning_content is not None:
+                reasoning_parts.append(reasoning_content)
+
+            content = getattr(delta, "content", None)
+            if content:
+                text_parts.append(content)
+
+        text = "".join(text_parts).strip()
+        self.last_reasoning_output = "".join(reasoning_parts).strip()
+        if not text:
+            raise ValueError("Qwen API returned an empty planner response.")
+        return text
+
+    @staticmethod
+    def _openai_extra_body() -> dict[str, Any]:
+        enable_thinking = ImagePlanner._openai_enable_thinking()
+        if enable_thinking is None:
+            return {}
+
+        return {"chat_template_kwargs": {"enable_thinking": enable_thinking}}
+
+    @staticmethod
+    def _openai_enable_thinking() -> bool | None:
+        if os.getenv("OPENAI_ENABLE_THINKING") is None:
+            return None
+        return ImagePlanner._env_flag("OPENAI_ENABLE_THINKING", default=True)
+
+    @staticmethod
+    def _getenv_nonempty(*names: str) -> str | None:
+        for name in names:
+            value = os.getenv(name)
+            if value:
+                return value
+        return None
+
+    @staticmethod
+    def _require_transformers_model_name() -> str:
+        model_name = ImagePlanner._getenv_nonempty("MM_REACT_TRANSFORMERS_MODEL")
+        if model_name is None:
+            raise RuntimeError(
+                "Missing transformers model. Set MM_REACT_TRANSFORMERS_MODEL "
+                "to a Hugging Face model id or local model path."
+            )
+        return model_name
+
+    @staticmethod
+    def _require_transformers_strategy() -> str:
+        strategy = ImagePlanner._getenv_nonempty("MM_REACT_TRANSFORMERS_STRATEGY")
+        if strategy is None:
+            raise RuntimeError(
+                "Missing transformers strategy. Set MM_REACT_TRANSFORMERS_STRATEGY "
+                "to 'chat'/'internvl' or 'vision2seq'/'processor'."
+            )
+        return strategy.lower()
 
     @staticmethod
     def _env_flag(name: str, default: bool = False) -> bool:
@@ -303,6 +441,263 @@ Planning history:
         prompt: str,
         current_image: str | Path,
     ) -> str:
+        strategy = self._require_transformers_strategy()
+        if strategy in {"chat", "internvl"}:
+            return self._generate_with_transformers_chat(
+                prompt=prompt,
+                current_image=current_image,
+            )
+        if strategy in {"vision2seq", "processor"}:
+            return self._generate_with_transformers_vision2seq(
+                prompt=prompt,
+                current_image=current_image,
+            )
+        raise ValueError(
+            "MM_REACT_TRANSFORMERS_STRATEGY must be 'chat'/'internvl' "
+            "or 'vision2seq'/'processor'."
+        )
+
+    def _generate_with_transformers_chat(
+        self,
+        prompt: str,
+        current_image: str | Path,
+    ) -> str:
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+
+        model_name = self._require_transformers_model_name()
+        model, tokenizer = self._get_transformers_chat_model(
+            torch_module=torch,
+            auto_model_cls=AutoModel,
+            auto_tokenizer_cls=AutoTokenizer,
+            model_name=model_name,
+        )
+
+        generation_config: dict[str, Any] = {
+            "max_new_tokens": int(
+                os.getenv("MM_REACT_TRANSFORMERS_MAX_NEW_TOKENS", "512")
+            ),
+            "do_sample": self._env_flag(
+                "MM_REACT_TRANSFORMERS_DO_SAMPLE",
+                default=False,
+            ),
+        }
+        for env_name, config_name, parser in (
+            ("MM_REACT_TRANSFORMERS_TEMPERATURE", "temperature", float),
+            ("MM_REACT_TRANSFORMERS_TOP_P", "top_p", float),
+            ("MM_REACT_TRANSFORMERS_TOP_K", "top_k", int),
+        ):
+            value = self._getenv_nonempty(env_name)
+            if value is not None:
+                generation_config[config_name] = parser(value)
+
+        device = self._transformers_device(torch)
+        pixel_values = None
+        question = prompt
+        if self._env_flag("MM_REACT_TRANSFORMERS_SEND_IMAGE", default=False):
+            pixel_values = self._load_internvl_image_tensor(
+                image_path=current_image,
+                torch_module=torch,
+                device=device,
+            )
+            question = f"<image>\n{prompt}"
+
+        response = model.chat(
+            tokenizer,
+            pixel_values,
+            question,
+            generation_config,
+        )
+        text = self._normalize_transformers_chat_response(response)
+        if not text:
+            raise ValueError("Transformers chat model returned an empty response.")
+        return text
+
+    def _get_transformers_chat_model(
+        self,
+        torch_module: Any,
+        auto_model_cls: Any,
+        auto_tokenizer_cls: Any,
+        model_name: str,
+    ) -> tuple[Any, Any]:
+        if (
+            self._transformers_model is not None
+            and self._transformers_tokenizer is not None
+            and self._transformers_model_name == model_name
+        ):
+            return self._transformers_model, self._transformers_tokenizer
+
+        trust_remote_code = self._env_flag(
+            "MM_REACT_TRANSFORMERS_TRUST_REMOTE_CODE",
+            default=True,
+        )
+        model_kwargs: dict[str, Any] = {
+            "torch_dtype": self._torch_dtype_from_env(torch_module),
+            "low_cpu_mem_usage": self._env_flag(
+                "MM_REACT_TRANSFORMERS_LOW_CPU_MEM_USAGE",
+                default=True,
+            ),
+            "trust_remote_code": trust_remote_code,
+            "use_flash_attn": self._env_flag(
+                "MM_REACT_TRANSFORMERS_USE_FLASH_ATTN",
+                default=False,
+            ),
+        }
+        model = auto_model_cls.from_pretrained(model_name, **model_kwargs)
+        model = model.eval()
+
+        device = self._transformers_device(torch_module)
+        if device == "cuda" and hasattr(model, "cuda"):
+            model = model.cuda()
+        elif device != "auto" and hasattr(model, "to"):
+            model = model.to(device)
+
+        tokenizer = auto_tokenizer_cls.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+            use_fast=self._env_flag(
+                "MM_REACT_TRANSFORMERS_USE_FAST_TOKENIZER",
+                default=False,
+            ),
+        )
+
+        self._transformers_model = model
+        self._transformers_tokenizer = tokenizer
+        self._transformers_model_name = model_name
+        return model, tokenizer
+
+    @staticmethod
+    def _torch_dtype_from_env(torch_module: Any) -> Any:
+        dtype_name = os.getenv("MM_REACT_TRANSFORMERS_TORCH_DTYPE", "bfloat16")
+        if dtype_name == "auto":
+            return "auto"
+
+        dtype_map = {
+            "bfloat16": "bfloat16",
+            "bf16": "bfloat16",
+            "float16": "float16",
+            "fp16": "float16",
+            "float32": "float32",
+            "fp32": "float32",
+        }
+        attr_name = dtype_map.get(dtype_name.lower())
+        if attr_name is None or not hasattr(torch_module, attr_name):
+            raise ValueError(
+                "MM_REACT_TRANSFORMERS_TORCH_DTYPE must be one of "
+                "bfloat16, bf16, float16, fp16, float32, fp32, or auto."
+            )
+        return getattr(torch_module, attr_name)
+
+    @staticmethod
+    def _transformers_device(torch_module: Any) -> str:
+        device = os.getenv("MM_REACT_TRANSFORMERS_DEVICE")
+        if device:
+            return device
+
+        cuda = getattr(torch_module, "cuda", None)
+        if cuda is not None and callable(getattr(cuda, "is_available", None)):
+            if cuda.is_available():
+                return "cuda"
+        return "cpu"
+
+    @staticmethod
+    def _normalize_transformers_chat_response(response: Any) -> str:
+        if isinstance(response, tuple):
+            response = response[0]
+        if response is None:
+            return ""
+        if isinstance(response, str):
+            return response.strip()
+        return str(response).strip()
+
+    def _load_internvl_image_tensor(
+        self,
+        image_path: str | Path,
+        torch_module: Any,
+        device: str,
+    ) -> Any:
+        from PIL import Image
+        import torchvision.transforms as transforms
+        from torchvision.transforms.functional import InterpolationMode
+
+        image_size = int(os.getenv("MM_REACT_TRANSFORMERS_IMAGE_SIZE", "448"))
+        max_tiles = int(os.getenv("MM_REACT_TRANSFORMERS_MAX_IMAGE_TILES", "12"))
+        image = Image.open(image_path).convert("RGB")
+        tiles = self._dynamic_preprocess_internvl_image(
+            image=image,
+            image_size=image_size,
+            max_tiles=max_tiles,
+        )
+        transform = transforms.Compose(
+            [
+                transforms.Resize(
+                    (image_size, image_size),
+                    interpolation=InterpolationMode.BICUBIC,
+                ),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=(0.485, 0.456, 0.406),
+                    std=(0.229, 0.224, 0.225),
+                ),
+            ]
+        )
+        pixel_values = torch_module.stack([transform(tile) for tile in tiles])
+        dtype = self._torch_dtype_from_env(torch_module)
+        if dtype != "auto":
+            pixel_values = pixel_values.to(dtype)
+        if device != "auto":
+            pixel_values = pixel_values.to(device)
+        return pixel_values
+
+    @staticmethod
+    def _dynamic_preprocess_internvl_image(
+        image: Any,
+        image_size: int,
+        max_tiles: int,
+    ) -> list[Any]:
+        width, height = image.size
+        aspect_ratio = width / height
+        target_ratios = {
+            (cols, rows)
+            for n in range(1, max_tiles + 1)
+            for cols in range(1, n + 1)
+            for rows in range(1, n + 1)
+            if 1 <= cols * rows <= max_tiles
+        }
+        target_ratio = min(
+            target_ratios,
+            key=lambda ratio: (
+                abs(aspect_ratio - ratio[0] / ratio[1]),
+                ratio[0] * ratio[1],
+            ),
+        )
+
+        cols, rows = target_ratio
+        resized = image.resize((cols * image_size, rows * image_size))
+        tiles = []
+        for row in range(rows):
+            for col in range(cols):
+                left = col * image_size
+                upper = row * image_size
+                tiles.append(
+                    resized.crop(
+                        (
+                            left,
+                            upper,
+                            left + image_size,
+                            upper + image_size,
+                        )
+                    )
+                )
+        if len(tiles) > 1:
+            tiles.append(image.resize((image_size, image_size)))
+        return tiles
+
+    def _generate_with_transformers_vision2seq(
+        self,
+        prompt: str,
+        current_image: str | Path,
+    ) -> str:
         try:
             from transformers import AutoModelForImageTextToText, AutoProcessor
         except ImportError:
@@ -311,10 +706,7 @@ Planning history:
                 AutoModelForVision2Seq as AutoModelForImageTextToText,
             )
 
-        model_name = os.getenv(
-            "MM_REACT_TRANSFORMERS_MODEL",
-            "Qwen/Qwen2.5-VL-3B-Instruct",
-        )
+        model_name = self._require_transformers_model_name()
         device = os.getenv("MM_REACT_TRANSFORMERS_DEVICE", "cpu")
         max_new_tokens = int(os.getenv("MM_REACT_TRANSFORMERS_MAX_NEW_TOKENS", "512"))
         trust_remote_code = (
@@ -322,15 +714,23 @@ Planning history:
             == "true"
         )
 
-        processor = AutoProcessor.from_pretrained(
-            model_name,
-            trust_remote_code=trust_remote_code,
-        )
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_name,
-            trust_remote_code=trust_remote_code,
-        ).to(device)
-        model.eval()
+        if (
+            self._transformers_processor is None
+            or self._transformers_model_name != model_name
+        ):
+            self._transformers_processor = AutoProcessor.from_pretrained(
+                model_name,
+                trust_remote_code=trust_remote_code,
+            )
+            self._transformers_model = AutoModelForImageTextToText.from_pretrained(
+                model_name,
+                trust_remote_code=trust_remote_code,
+            ).to(device)
+            self._transformers_model.eval()
+            self._transformers_model_name = model_name
+
+        processor = self._transformers_processor
+        model = self._transformers_model
 
         messages = [
             {

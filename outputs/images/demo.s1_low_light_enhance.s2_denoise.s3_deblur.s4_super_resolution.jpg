@@ -1,4 +1,0 @@
-This is a mock image artifact for the MM-ReAct demo.
-input_image=outputs/images/demo.s1_low_light_enhance.s2_denoise.s3_deblur.jpg
-tool_name=super_resolution
-args={'scale': 4}

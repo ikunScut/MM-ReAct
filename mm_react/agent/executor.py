@@ -1,8 +1,8 @@
-"""Executor demo for MM-ReAct image enhancement steps.
+"""Executor for MM-ReAct image enhancement steps.
 
-The ReAct loop gives the executor one ToolCall at a time. This demo uses mock
-tools that only create output paths and observations. Real image enhancement models
-can be plugged in by passing a custom tool_registry.
+The ReAct loop gives the executor one ToolCall at a time. The tool registry
+dispatches to image enhancement tools. Alternative tools can be plugged in by
+passing a custom tool_registry.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..tools import DEFAULT_TOOL_REGISTRY, ToolFn, ToolObservation
+from ..tools import TOOL_REGISTRY, ToolFn, ToolObservation
 from .memory import AgentMemory
 from .planner import ToolCall
 
@@ -33,8 +33,20 @@ class ImageExecutor:
         output_dir: str | Path = "outputs/images",
         tool_registry: dict[str, ToolFn] | None = None,
     ) -> None:
-        self.output_dir = Path(output_dir)
-        self.tool_registry = tool_registry or dict(DEFAULT_TOOL_REGISTRY)
+        self.output_dir = Path(output_dir).expanduser().resolve()
+        self.tool_registry = tool_registry or dict(TOOL_REGISTRY)
+        self._run_output_dir: Path | None = None
+        self._run_stem = "image"
+        self._run_suffix = ".png"
+
+    def begin_run(self, input_image: str | Path) -> None:
+        """Prepare the per-image output folder for one ReAct run."""
+
+        input_path = Path(input_image).expanduser().resolve()
+        self._run_stem = input_path.stem or "image"
+        self._run_suffix = input_path.suffix or ".png"
+        self._run_output_dir = self.output_dir / self._run_stem
+        self._run_output_dir.mkdir(parents=True, exist_ok=True)
 
     def execute_step(
         self,
@@ -45,8 +57,9 @@ class ImageExecutor:
     ) -> StepResult:
         """Run exactly one tool call and return its observation."""
 
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        input_path = Path(input_image)
+        input_path = Path(input_image).expanduser().resolve()
+        if self._run_output_dir is None:
+            self.begin_run(input_path)
         tool = self.tool_registry.get(tool_call.tool_name)
         if tool is None:
             message = f"Tool is not registered: {tool_call.tool_name}"
@@ -92,7 +105,10 @@ class ImageExecutor:
     def _make_output_path(
         self, input_image: Path, tool_name: str, step_index: int
     ) -> Path:
-        suffix = input_image.suffix or ".png"
-        stem = input_image.stem or "image"
+        _ = input_image
         safe_tool_name = tool_name.replace(" ", "_")
-        return self.output_dir / f"{stem}.s{step_index}_{safe_tool_name}{suffix}"
+        run_output_dir = self._run_output_dir or self.output_dir / self._run_stem
+        return (
+            run_output_dir
+            / f"{self._run_stem}.s{step_index}_{safe_tool_name}{self._run_suffix}"
+        )

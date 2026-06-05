@@ -1,66 +1,49 @@
 Output Format Rules
 ===================
 
-The agent may run for multiple ReAct turns. Each turn must use the same output
-format. A normal intermediate turn should contain a thought and at most one tool
-call, but no final answer. Only the last turn should contain the final answer.
-
-You must output exactly one response in the following XML-like format:
+Every response must contain exactly these three tags in this order. Do not omit
+any tag, even when its content is empty:
 
 <thought>
-Briefly explain the next reasoning step based on the user request and the latest observation.
+One short sentence only. State the immediate rationale for the next action or final answer. Do not include step-by-step reasoning, repeated observations, or long analysis.
 </thought>
 <tool>
-{
-  "tool_name": "one registered tool name",
-  "args": {
-    "key": "value"
-  }
-}
+One valid JSON tool call, or null.
 </tool>
 <final_answer>
-If the task is complete, write the final answer here. Otherwise leave this section empty.
+Final answer only when done; otherwise empty.
 </final_answer>
 
 Rules:
-- Do not output markdown.
-- Do not output any text before `<thought>` or after `</final_answer>`.
-- Do not wrap the response in code fences.
-- The `<thought>` section must contain plain text only.
-- The `<tool>` section must contain valid JSON only.
-- The `<final_answer>` section must be present in every turn.
-- The JSON inside `<tool>` must be either one object or `null`.
-- For an intermediate ReAct turn, output exactly one tool call object in `<tool>` and leave `<final_answer>` empty.
-- For the final ReAct turn, output `null` in `<tool>` and write the final response in `<final_answer>`.
-- After each `<thought>`, call at most one kind of tool. Never output a list or batch of multiple tools.
-- If multiple tools are needed, choose only the next best tool for this turn; later tools can be selected after observing its result.
-- If `<tool>` contains a tool call, `<final_answer>` must be empty.
-- If `<tool>` is `null`, `<final_answer>` must contain the final response to the user.
-- Every `tool_name` must exactly match one registered tool name.
-- Every `args` object must follow that tool's Input Schema.
+- No text before `<thought>` or after `</final_answer>`.
+- Do not use markdown or code fences.
+- The `<thought>` section must be plain text only.
+- The `<tool>` section must be valid JSON only: either one JSON object or `null`.
+- The JSON object in `<tool>` must contain `"tool_name"` and `"args"`.
+- Use either a tool call or a final answer, never both.
+- Intermediate turn: `<tool>` has exactly one registered tool call and
+  `<final_answer>` is empty.
+- Final turn: `<tool>null</tool>` and `<final_answer>` has the answer.
 
-Valid intermediate ReAct turn example:
+Valid intermediate turn:
 
 <thought>
-The image is underexposed, so the next step is to enhance low-light regions.
+Need clearer visual evidence.
 </thought>
 <tool>
-{
-  "tool_name": "low_light_enhance",
-  "args": {}
-}
+{"tool_name": "object_detection_image", "args": {"text_prompt": "object"}}
 </tool>
 <final_answer>
 </final_answer>
 
-Valid final ReAct turn example:
+Valid final turn:
 
 <thought>
-The requested enhancements have been completed and no more tools are needed.
+The image is clear enough to answer.
 </thought>
 <tool>
 null
 </tool>
 <final_answer>
-The image enhancement is complete. The final enhanced image is saved at outputs/images/final.jpg.
+The surface looks clean.
 </final_answer>

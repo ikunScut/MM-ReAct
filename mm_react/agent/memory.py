@@ -7,6 +7,7 @@ printed, saved, or later replaced by a database-backed implementation.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ class AgentMemory:
 
     def __init__(self) -> None:
         self.events: list[MemoryEvent] = []
+        self.sft_records: list[dict[str, Any]] = []
 
     def add_user_request(self, request: str, image_path: str | Path) -> None:
         self.add(
@@ -107,6 +109,55 @@ class AgentMemory:
             MemoryEvent(event_type=event_type, message=message, data=data)
         )
 
+    def add_sft_turn(
+        self,
+        current_image: str | Path,
+        student_prompt: str,
+        assistant_output: str,
+    ) -> None:
+        """Store one student-visible input/output pair for ReAct SFT."""
+
+        current_image_text = str(current_image)
+        record = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": current_image_text},
+                        {"type": "text", "text": student_prompt},
+                    ],
+                },
+                {"role": "assistant", "content": assistant_output},
+            ],
+        }
+        self.sft_records.append(record)
+
+    def to_sft_records(self) -> list[dict[str, Any]]:
+        """Return JSON-serializable SFT records, one record per ReAct turn."""
+
+        return self._to_jsonable(self.sft_records)
+
+    def save_sft_jsonl(self, path: str | Path) -> Path:
+        """Save SFT records as JSONL, one training example per line."""
+
+        sft_path = Path(path)
+        sft_path.parent.mkdir(parents=True, exist_ok=True)
+        with sft_path.open("w", encoding="utf-8") as f:
+            for record in self.to_sft_records():
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return sft_path
+
+    def save_sft_json(self, path: str | Path) -> Path:
+        """Save SFT records as one JSON array."""
+
+        sft_path = Path(path)
+        sft_path.parent.mkdir(parents=True, exist_ok=True)
+        sft_path.write_text(
+            json.dumps(self.to_sft_records(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return sft_path
+
     def to_trace(self) -> str:
         lines = ["MM-ReAct Trace", "==============", ""]
         for index, event in enumerate(self.events, start=1):
@@ -121,3 +172,20 @@ class AgentMemory:
         trace_path.parent.mkdir(parents=True, exist_ok=True)
         trace_path.write_text(self.to_trace() + "\n", encoding="utf-8")
         return trace_path
+
+    @staticmethod
+    def _to_jsonable(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {
+                str(key): AgentMemory._to_jsonable(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [AgentMemory._to_jsonable(item) for item in value]
+        try:
+            json.dumps(value, ensure_ascii=False)
+        except TypeError:
+            return str(value)
+        return value

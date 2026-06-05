@@ -1,22 +1,110 @@
 Available Tools
 ===============
 
-- Tool Name: `low_light_enhance`
-  Backend: Zero-DCE
-  Description: Enhance underexposed or low-light images while preserving natural brightness, contrast, and color.
-  When To Use: Use when the image is too dark, underexposed, or lacks shadow details.
-  When Not To Use: Do not use when the image is already normally exposed or when the user asks for denoising, deblurring, upscaling, face restoration, or color editing that Zero-DCE does not provide.
-  Input Schema:
+- Tool Name: `object_detection_image`
+  Description: Detect/localize visible objects or classes; returns JSON boxes only. Not for enhancement, upscaling, restoration, lighting, face, or color edits.
+  Args:
     {
-      "image_path": {"type": "string", "description": "Path to the input image."}
+      "text_prompt": {"type": "string", "description": "Objects/classes to detect, e.g. 'cat' or 'person . dog'. Use 'object' if unspecified."},
+      "box_threshold": {"type": "number", "description": "Box confidence threshold. Default 0.3."},
+      "text_threshold": {"type": "number", "description": "Text matching threshold. Default 0.25."}
     }
   Output Schema:
     {
-      "output_image": {"type": "string", "description": "Path to the enhanced image."},
-      "observation": {"type": "string", "description": "Brief result observation for the planner."}
+      "observation": {
+        "type": "object",
+        "properties": {
+          "image_size": {"description": "Input image size."},
+          "detections_count": {"type": "integer", "description": "Detection count."},
+          "predictions": {"type": "array", "description": "Detected boxes and metadata."}
+        }
+      }
+    }
+  Example:
+    {
+      "tool_name": "object_detection_image",
+      "args": {"text_prompt": "person . backpack . bench", "box_threshold": 0.3, "text_threshold": 0.25}
+    }
+
+- Tool Name: `low_light_enhance`
+  Description: Brighten low-light or underexposed images. Not for detection, upscaling, denoise, deblur, face, or color edits.
+  Args:
+    {}
+  Output Schema:
+    {
+      "observation": {"type": "string", "description": "Low-light image brightening completed."}
     }
   Example:
     {
       "tool_name": "low_light_enhance",
       "args": {}
+    }
+
+- Tool Name: `zoom_in_image`
+  Description: Crop/enlarge a detected region for detail, text, or small objects. Requires an exact prior object_detection_image box; never guess coordinates.
+  Args:
+    {
+      "box": {"type": "array", "description": "Pixel box [x_min, y_min, x_max, y_max] copied from observation.predictions[].box."},
+      "padding_ratio": {"type": "number", "description": "Box padding ratio. Default 0.2."},
+      "min_output_size": {"type": "integer", "description": "Minimum long side after resize. Default 768."}
+    }
+  Output Schema:
+    {
+      "observation": {"type": "string", "description": "Image crop and zoom-in enlargement completed."}
+    }
+  Example:
+    {
+      "tool_name": "zoom_in_image",
+      "args": {"box": [120, 80, 310, 460], "padding_ratio": 0.2, "min_output_size": 768}
+    }
+
+- Tool Name: `rotate_image`
+  Description: Rotate/straighten when requested, or only when VQA needs it and direction is clear. Not for guessed orientation or non-rotation tasks.
+  Args:
+    {
+      "angle": {"type": "number", "description": "Rotation angle in degrees."},
+      "direction": {"type": "string", "enum": ["clockwise", "counterclockwise"], "description": "Rotation direction. Default clockwise."},
+      "expand": {"type": "boolean", "description": "Expand canvas after rotation. Default true."},
+      "fill_color": {"type": "string", "description": "Corner fill color. Default white or transparent."}
+    }
+  Output Schema:
+    {
+      "observation": {"type": "string", "description": "Rotation completion message; not orientation verification."}
+    }
+  Example:
+    {
+      "tool_name": "rotate_image",
+      "args": {"angle": 90, "direction": "clockwise", "expand": true}
+    }
+
+- Tool Name: `nafnet_image_restoration`
+  Description: Denoise/deblur noisy or blurred images when requested. Not for ordinary VQA, detection, upscaling, lighting, face, or color edits.
+  Args:
+    {
+      "mode": {"type": "string", "enum": ["denoise", "deblur"], "description": "Restoration mode."}
+    }
+  Output Schema:
+    {
+      "observation": {"type": "string", "description": "Denoise/deblur completion message."}
+    }
+  Example:
+    {
+      "tool_name": "nafnet_image_restoration",
+      "args": {"mode": "denoise"}
+    }
+
+- Tool Name: `super_resolution_image`
+  Description: Upscale low-resolution or pixelated images. Not for lighting, deblur, denoise, face, detection, or color edits.
+  Args:
+    {
+      "bs": {"type": "integer", "description": "Batch size. Default 1."}
+    }
+  Output Schema:
+    {
+      "observation": {"type": "string", "description": "Image super-resolution upscaling completed."}
+    }
+  Example:
+    {
+      "tool_name": "super_resolution_image",
+      "args": {"bs": 1}
     }

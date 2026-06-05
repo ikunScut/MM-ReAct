@@ -1,14 +1,8 @@
-"""ReAct loop controller for MM-ReAct.
-
-This module wires planner, executor, and memory into the classic loop:
-
-Thought -> Action -> Observation -> Thought -> ... -> Final Answer
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .executor import ImageExecutor, StepResult
 from .memory import AgentMemory
@@ -40,13 +34,19 @@ class ReActAgent:
         self.memory = memory or AgentMemory()
         self.max_turns = max_turns
 
-    def run(self, user_request: str, input_image: str | Path) -> ReActRunResult:
+    def run(
+        self,
+        user_request: str,
+        input_image: str | Path,
+        gold_answer: Any | None = None,
+    ) -> ReActRunResult:
         input_path = Path(input_image)
         current_image = input_path
         planning_history: list[PlanningHistoryItem] = []
         step_results: list[StepResult] = []
 
         self.memory.add_user_request(user_request, input_path)
+        self.executor.begin_run(input_path)
 
         for turn in range(1, self.max_turns + 1):
             decision = self.planner.next_decision(
@@ -54,8 +54,14 @@ class ReActAgent:
                 input_image=input_path,
                 current_image=current_image,
                 planning_history=planning_history,
+                gold_answer=gold_answer,
             )
             self.memory.add_thought(turn, decision)
+            self.memory.add_sft_turn(
+                current_image=current_image,
+                student_prompt=self.planner.last_student_prompt,
+                assistant_output=self.planner.last_model_output,
+            )
             history_item = self._history_item(turn, decision)
             planning_history.append(history_item)
 

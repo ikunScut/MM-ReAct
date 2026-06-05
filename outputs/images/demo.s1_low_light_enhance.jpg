@@ -1,4 +1,0 @@
-This is a mock image artifact for the MM-ReAct demo.
-input_image=examples/inputs/demo.jpg
-tool_name=low_light_enhance
-args={'strength': 0.75}
